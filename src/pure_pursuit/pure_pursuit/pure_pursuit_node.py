@@ -66,7 +66,8 @@ class PurePursuit(Node):
         self.declare_parameter('waypoints_file_path', 'test.csv')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('lookahead', 2.0)
+        self.declare_parameter('lookahead_min', 0.7)      # at speed_min
+        self.declare_parameter('lookahead_max', 2.5)      # at speed (= v_max)
         self.declare_parameter('speed', 5.0)              # v_max
         self.declare_parameter('speed_min', 1.5)          # floor through tight corners
         self.declare_parameter('lateral_accel_max', 4.0)  # friction-limited budget, m/s^2
@@ -78,9 +79,15 @@ class PurePursuit(Node):
         odom_topic = self.get_parameter('odom_topic').value
         drive_topic = self.get_parameter('drive_topic').value
 
-        self.l = float(self.get_parameter('lookahead').value)
         self.v_max = float(self.get_parameter('speed').value)
         self.v_min = float(self.get_parameter('speed_min').value)
+        self.l_min = float(self.get_parameter('lookahead_min').value)
+        self.l_max = float(self.get_parameter('lookahead_max').value)
+        
+        # Linear schedule Ld = a + b*v over [v_min, v_max], clipped at [l_min, l_max].
+        self.lookahead_b = (self.l_max - self.l_min) / max(self.v_max - self.v_min, 1e-3)
+        self.lookahead_a = self.l_min - self.lookahead_b * self.v_min
+        self.l = self.l_min  # current value, updated each callback
         self.a_lat_max = float(self.get_parameter('lateral_accel_max').value)
         self.max_steering = float(self.get_parameter('max_steering').value)
         self.window = int(self.get_parameter('search_window').value)
@@ -99,7 +106,7 @@ class PurePursuit(Node):
         self.waypoints = load_waypoints_xy(wp_path)
         self.n = len(self.waypoints)
 
-        # Friction-limited speed profile: a_lat = v^2 * kappa  =>  v = sqrt(a/kappa).
+        # Friction-limited speed: a_lat = v^2 * kappa  =>  v = sqrt(a/kappa).
         # Smooth kappa first since lab6's interpolated waypoints can be jagged.
         kappa = smooth_circular(compute_curvature(self.waypoints), window=7)
         v_curv = np.sqrt(self.a_lat_max / np.maximum(kappa, 1e-3))
@@ -153,6 +160,11 @@ class PurePursuit(Node):
         carX = odom_msg.pose.pose.position.x
         carY = odom_msg.pose.pose.position.y
         yaw = self._get_yaw(odom_msg)
+
+        # Adaptive lookahead: Ld grows linearly with current speed.
+        v = float(odom_msg.twist.twist.linear.x)
+        self.l = float(np.clip(self.lookahead_a + self.lookahead_b * v,
+                               self.l_min, self.l_max))
 
         nearest_idx, best_dist_sq = self._windowed_scan(carX, carY)
         if best_dist_sq > self.reset_dist_thresh ** 2:
