@@ -11,6 +11,33 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 
 
+def compute_curvature(xy: np.ndarray) -> np.ndarray:
+    """Per-waypoint absolute curvature on a closed loop.
+
+    Uses the 3-point Menger formula: kappa = 2 * |cross(d_prev, d_next)| /
+    (|d_prev| * |d_next| * |d_span|). np.roll handles lap-closure wrap.
+    """
+    p_prev = np.roll(xy, 1, axis=0)
+    p_next = np.roll(xy, -1, axis=0)
+    d_prev = xy - p_prev
+    d_next = p_next - xy
+    d_span = p_next - p_prev
+    cross = d_prev[:, 0] * d_next[:, 1] - d_prev[:, 1] * d_next[:, 0]
+    a = np.linalg.norm(d_prev, axis=1)
+    b = np.linalg.norm(d_next, axis=1)
+    c = np.linalg.norm(d_span, axis=1)
+    return np.abs(2.0 * cross / np.maximum(a * b * c, 1e-9))
+
+
+def smooth_circular(x: np.ndarray, window: int) -> np.ndarray:
+    """Boxcar moving average on a closed-loop signal."""
+    if window <= 1:
+        return x
+    kernel = np.ones(window) / window
+    padded = np.concatenate([x[-window:], x, x[:window]])
+    return np.convolve(padded, kernel, mode='same')[window:window + len(x)]
+
+
 def load_waypoints_xy(path: Path) -> np.ndarray:
     """Load Nx2 (x, y) array from a waypoints CSV.
 
@@ -40,7 +67,9 @@ class PurePursuit(Node):
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
         self.declare_parameter('lookahead', 2.0)
-        self.declare_parameter('speed', 5.0)
+        self.declare_parameter('speed', 5.0)              # v_max
+        self.declare_parameter('speed_min', 1.5)          # floor through tight corners
+        self.declare_parameter('lateral_accel_max', 4.0)  # friction-limited budget, m/s^2
         self.declare_parameter('max_steering', 0.4)
         self.declare_parameter('search_window', 100)
         self.declare_parameter('reset_dist_thresh', 5.0)
@@ -50,16 +79,36 @@ class PurePursuit(Node):
         drive_topic = self.get_parameter('drive_topic').value
 
         self.l = float(self.get_parameter('lookahead').value)
-        self.speed = float(self.get_parameter('speed').value)
+        self.v_max = float(self.get_parameter('speed').value)
+        self.v_min = float(self.get_parameter('speed_min').value)
+        self.a_lat_max = float(self.get_parameter('lateral_accel_max').value)
         self.max_steering = float(self.get_parameter('max_steering').value)
         self.window = int(self.get_parameter('search_window').value)
         self.reset_dist_thresh = float(self.get_parameter('reset_dist_thresh').value)
 
         self.current_idx = 0
+        self.wheelbase = 0.33  # F1TENTH chassis
+
+        # Low-pass filter state for the curvature command
+        #   gamma_bar_t = (1 - beta) * gamma_bar_{t-1} + beta * gamma_t
+        # Damps frame-to-frame jumps in the steering command (e.g. from the
+        # lookahead point flipping between waypoints) without blocking real turns.
+        self.gamma_filt = 0.0
+        self.gamma_beta = 0.6  # paper's value
 
         self.waypoints = load_waypoints_xy(wp_path)
         self.n = len(self.waypoints)
-        self.get_logger().info(f"Loaded {self.n} waypoints from {wp_path}")
+
+        # Friction-limited speed profile: a_lat = v^2 * kappa  =>  v = sqrt(a/kappa).
+        # Smooth kappa first since lab6's interpolated waypoints can be jagged.
+        kappa = smooth_circular(compute_curvature(self.waypoints), window=7)
+        v_curv = np.sqrt(self.a_lat_max / np.maximum(kappa, 1e-3))
+        self.speed_profile = np.clip(v_curv, self.v_min, self.v_max)
+
+        self.get_logger().info(
+            f"Loaded {self.n} waypoints from {wp_path}; "
+            f"speed profile {self.speed_profile.min():.2f}-{self.speed_profile.max():.2f} m/s"
+        )
 
         self.odom_sub = self.create_subscription(
             Odometry, odom_topic, self.odom_callback, 10
@@ -118,12 +167,16 @@ class PurePursuit(Node):
         dy = goal[1] - carY
         local_y = dx * np.sin(-yaw) + dy * np.cos(-yaw)
 
-        steering_angle = np.arctan2(2.0 * local_y, self.l ** 2)
+        # Pure pursuit curvature command gamma = 2 * y' / Ld^2, then low-pass
+        # before turning it into a steering angle 
+        gamma = 2.0 * local_y / (self.l ** 2)
+        self.gamma_filt = (1.0 - self.gamma_beta) * self.gamma_filt + self.gamma_beta * gamma
+        steering_angle = np.arctan(self.wheelbase * self.gamma_filt)
         steering_angle = float(np.clip(steering_angle, -self.max_steering, self.max_steering))
 
         drive_msg = AckermannDriveStamped()
         drive_msg.drive.steering_angle = steering_angle
-        drive_msg.drive.speed = self.speed
+        drive_msg.drive.speed = float(self.speed_profile[lookahead_idx])
         self.drive_pub.publish(drive_msg)
 
 
